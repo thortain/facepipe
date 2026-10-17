@@ -1,0 +1,8 @@
+__pycache__/
+*.pyc
+face_landmarker.task
+*.ndjson
+recordings/
+.venv/
+venv/
+.DS_Store
