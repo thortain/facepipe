@@ -28,6 +28,7 @@ https://github.com/emoto-yasushi/iFacialMocap_Facemotion3d_udp-tcp_v3
 from __future__ import annotations
 
 import math
+import queue
 import socket
 import struct
 import threading
@@ -37,6 +38,7 @@ from typing import List, Optional, Sequence, Tuple
 
 from .blendshapes import IDENTIFIERS
 from .frame import Frame
+from .network import require_private_bind
 
 MAGIC = b"FMV3"
 HEADER_FORMAT = "<4sBBHQIIIIHHI"
@@ -262,9 +264,12 @@ class FMV3Sender:
 
     def __init__(self, *, udp_port: int = IOS_UDP_PORT, tcp_port: Optional[int] = IOS_TCP_PORT,
                  fps: int = 60, mode: int = MODE_FIXED52, blend_names: Sequence[str] = IDENTIFIERS,
-                 app: str = "FacePipe", profile: str = "facepipe", source_token: int = 0) -> None:
+                 app: str = "FacePipe", profile: str = "facepipe", source_token: int = 0,
+                 bind_host: str = "127.0.0.1", max_clients: int = 32) -> None:
+        self.bind_host = require_private_bind(bind_host)
         self.udp_port = udp_port
         self.tcp_port = tcp_port
+        self.max_clients = max_clients
         self.fps = max(1, min(60, fps))
         self.mode = mode
         self.blend_names = tuple(blend_names)
@@ -276,16 +281,16 @@ class FMV3Sender:
         self.sequence = 0
         self.running = threading.Event()
         self._sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-        self._sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-        self._sock.bind(("", udp_port))
+        self._sock.bind((bind_host, udp_port))
+        self._sock.settimeout(0.2)
         self._peers = {}          # (ip, port) -> session state
         self._lock = threading.Lock()
         self._tcp_server = None
         if tcp_port:
             self._tcp_server = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-            self._tcp_server.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-            self._tcp_server.bind(("", tcp_port))
+            self._tcp_server.bind((bind_host, tcp_port))
             self._tcp_server.listen(5)
+            self._tcp_server.settimeout(0.2)
 
     def _schema_body(self, client_nonce: int, actual_fps: int, max_udp_size: int) -> bytes:
         schema = Schema(client_nonce=client_nonce, actual_fps=actual_fps,
@@ -306,34 +311,114 @@ class FMV3Sender:
     def _send(self, peer, message_type: int, session_id: int, payload: bytes = b"",
               schema_id: int = 0, sequence: int = 0, flags: int = 0,
               source_token: int = 0, part_index: int = 0, part_count: int = 1,
-              total_payload_length: Optional[int] = None) -> None:
+              total_payload_length: Optional[int] = None, send_lock=None) -> None:
         msg = build_message(message_type, payload, session_id=session_id, schema_id=schema_id,
                             sequence=sequence, flags=flags, source_token=source_token,
                             part_index=part_index, part_count=part_count,
                             total_payload_length=total_payload_length)
         if isinstance(peer, socket.socket):
-            peer.sendall(msg)
+            if send_lock is None:
+                peer.sendall(msg)
+            else:
+                with send_lock:
+                    peer.sendall(msg)
         else:
             self._sock.sendto(msg, peer)
 
+    def _drop_peer(self, peer, expected=None) -> None:
+        with self._lock:
+            state = self._peers.get(peer)
+            if state is None or (expected is not None and state is not expected):
+                return
+            del self._peers[peer]
+        state["stop"].set()
+        if isinstance(peer, socket.socket):
+            try:
+                peer.close()
+            except OSError:
+                pass
+
+    def _add_peer(self, peer, state: dict) -> bool:
+        state["queue"] = queue.Queue(maxsize=2)
+        state["stop"] = threading.Event()
+        state["send_lock"] = threading.Lock()
+        state["last_seen"] = time.monotonic()
+        with self._lock:
+            if peer not in self._peers and len(self._peers) >= self.max_clients:
+                return False
+            previous = self._peers.get(peer)
+            self._peers[peer] = state
+        if previous:
+            previous["stop"].set()
+        threading.Thread(target=self._peer_worker, args=(peer, state), daemon=True).start()
+        return True
+
+    def _prune_peers(self) -> None:
+        now = time.monotonic()
+        with self._lock:
+            stale = [(peer, state) for peer, state in self._peers.items()
+                     if now - state["last_seen"] > LEASE_MS / 1000]
+        for peer, state in stale:
+            self._drop_peer(peer, state)
+
+    def _peer_worker(self, peer, state: dict) -> None:
+        interval = 1.0 / state["schema"].actual_fps
+        next_send = time.monotonic()
+        while self.running.is_set() and not state["stop"].is_set():
+            try:
+                frame, sequence = state["queue"].get(timeout=0.2)
+            except queue.Empty:
+                continue
+            delay = next_send - time.monotonic()
+            if delay > 0 and state["stop"].wait(delay):
+                break
+            # A slow peer receives the freshest frame, without delaying other peers.
+            try:
+                while True:
+                    frame, sequence = state["queue"].get_nowait()
+            except queue.Empty:
+                pass
+            if time.monotonic() - state["last_seen"] > LEASE_MS / 1000:
+                self._drop_peer(peer, state)
+                break
+            try:
+                body = encode_frame_body(frame, state["schema"])
+                parts = (fragment(body, state["max_udp_size"] - HEADER_SIZE)
+                         if isinstance(peer, tuple) else [body])
+                for index, part in enumerate(parts):
+                    self._send(peer, FRAME, state["session_id"], part,
+                               schema_id=self.schema_id, sequence=sequence,
+                               flags=1 if frame.tracking else 0,
+                               source_token=self.source_token,
+                               part_index=index, part_count=len(parts),
+                               total_payload_length=len(body),
+                               send_lock=state["send_lock"])
+            except (OSError, ValueError, struct.error):
+                self._drop_peer(peer, state)
+                break
+            next_send = max(next_send + interval, time.monotonic())
+
     def push(self, frame: Frame) -> int:
-        """Send one frame to every acknowledged peer. Returns the number of peers served."""
+        """Queue the latest frame independently for every acknowledged peer."""
+        self._prune_peers()
         with self._lock:
             peers = list(self._peers.items())
         served = 0
         for peer, state in peers:
-            if not state.get("acknowledged"):
+            if not state.get("acknowledged") or state["stop"].is_set():
                 continue
-            body = encode_frame_body(frame, state["schema"])
-            capacity = state["max_udp_size"] - HEADER_SIZE
-            parts = fragment(body, capacity) if isinstance(peer, tuple) else [body]
-            for i, part in enumerate(parts):
-                self._send(peer, FRAME, state["session_id"], part,
-                           schema_id=self.schema_id, sequence=self.sequence,
-                           flags=1 if frame.tracking else 0,
-                           source_token=self.source_token,
-                           part_index=i, part_count=len(parts),
-                           total_payload_length=len(body))
+            item = (frame, self.sequence)
+            try:
+                state["queue"].put_nowait(item)
+            except queue.Full:
+                try:
+                    state["queue"].get_nowait()
+                except queue.Empty:
+                    pass
+                try:
+                    state["queue"].put_nowait(item)
+                except queue.Full:
+                    pass
             served += 1
         self.sequence += 1
         return served
@@ -357,15 +442,21 @@ class FMV3Sender:
 
     def stop(self) -> None:
         self.running.clear()
+        with self._lock:
+            peers = list(self._peers.items())
+        for peer, state in peers:
+            self._drop_peer(peer, state)
         self._sock.close()
         if self._tcp_server:
             self._tcp_server.close()
 
     def _handle_udp(self) -> None:
-        assembler = FragmentAssembler()
         while self.running.is_set():
             try:
                 data, peer = self._sock.recvfrom(2048)
+            except socket.timeout:
+                self._prune_peers()
+                continue
             except OSError:
                 break
             if len(data) < HEADER_SIZE:
@@ -377,6 +468,8 @@ class FMV3Sender:
             if not is_valid_header(header):
                 continue
             payload = data[HEADER_SIZE:]
+            if header.chunk_length != len(payload) or header.part_count != 1:
+                continue
             if header.message_type == HELLO:
                 if len(payload) != 10:
                     continue
@@ -392,6 +485,7 @@ class FMV3Sender:
                     existing = self._peers.get(peer)
                     if existing and existing["session_id"] == header.session_id:
                         # same HELLO repeated: resend the schema, keep the session alive
+                        existing["last_seen"] = time.monotonic()
                         self._send_schema(peer, header.session_id, existing["schema"].body())
                         continue
                 actual_fps = max(1, min(self.fps, fps or self.fps))
@@ -402,35 +496,45 @@ class FMV3Sender:
                                 blend_encoding=ENC_I32 if mode == MODE_FIXED52 else ENC_I16,
                                 blend_count=len(self.blend_names), app=self.app,
                                 profile=self.profile, blend_names=self.blend_names)
-                with self._lock:
-                    self._peers[peer] = {"session_id": header.session_id, "schema": schema,
-                                        "max_udp_size": max_udp, "acknowledged": False,
-                                        "last_seen": time.time()}
+                if not self._add_peer(peer, {"session_id": header.session_id,
+                                             "schema": schema, "max_udp_size": max_udp,
+                                             "acknowledged": False}):
+                    self._send(peer, ERROR, header.session_id, b"BUSY")
+                    continue
                 self._send_schema(peer, header.session_id, schema.body())
             elif header.message_type == SCHEMA_ACK:
                 with self._lock:
                     state = self._peers.get(peer)
-                    if state and header.session_id == state["session_id"]:
+                    if state and header.session_id == state["session_id"] \
+                            and header.schema_id == self.schema_id:
                         state["acknowledged"] = True
+                        state["last_seen"] = time.monotonic()
             elif header.message_type == PING:
-                self._send(peer, PONG, header.session_id, sequence=header.sequence)
                 with self._lock:
                     state = self._peers.get(peer)
-                    if state:
-                        state["last_seen"] = time.time()
+                    if state and header.session_id == state["session_id"]:
+                        state["last_seen"] = time.monotonic()
+                    else:
+                        state = None
+                if state:
+                    self._send(peer, PONG, header.session_id, sequence=header.sequence)
             elif header.message_type == STOP:
                 with self._lock:
-                    self._peers.pop(peer, None)
+                    state = self._peers.get(peer)
+                if state and state["session_id"] == header.session_id:
+                    self._drop_peer(peer, state)
             elif header.message_type == GET_SCHEMA:
                 with self._lock:
                     state = self._peers.get(peer)
-                if state:
+                if state and state["session_id"] == header.session_id:
                     self._send_schema(peer, state["session_id"], state["schema"].body())
 
     def _handle_tcp(self) -> None:
         while self.running.is_set():
             try:
                 conn, _ = self._tcp_server.accept()
+            except socket.timeout:
+                continue
             except OSError:
                 break
             threading.Thread(target=self._tcp_connection, args=(conn,), daemon=True).start()
@@ -438,44 +542,65 @@ class FMV3Sender:
     def _tcp_connection(self, conn: socket.socket) -> None:
         buffer = b""
         state = None
+        conn.settimeout(0.5)
         try:
             while self.running.is_set():
-                chunk = conn.recv(4096)
+                try:
+                    chunk = conn.recv(4096)
+                except socket.timeout:
+                    continue
                 if not chunk:
                     break
                 buffer += chunk
                 while len(buffer) >= HEADER_SIZE:
-                    header = Header.unpack(buffer[:HEADER_SIZE])
+                    try:
+                        header = Header.unpack(buffer[:HEADER_SIZE])
+                    except ValueError:
+                        return
+                    if not is_valid_header(header) or header.chunk_length > 65536:
+                        return
                     need = HEADER_SIZE + header.chunk_length
                     if len(buffer) < need:
                         break
                     payload = buffer[HEADER_SIZE:need]
                     buffer = buffer[need:]
                     if header.message_type == HELLO:
+                        if state is not None or len(payload) != HELLO_BODY.size:
+                            return
                         fps, udp_size, revision, mode = HELLO_BODY.unpack(payload)
+                        if revision != CONTRACT_REVISION or mode not in (MODE_VARIABLE, MODE_FIXED52):
+                            self._send(conn, ERROR, header.session_id, b"UNSUPPORTED_CONTRACT_OR_MODE")
+                            return
                         schema = Schema(client_nonce=header.session_id,
                                         actual_fps=max(1, min(self.fps, fps or self.fps)),
                                         max_udp_size=max_udp_size(udp_size), lease_ms=LEASE_MS,
                                         mode=mode, blend_encoding=ENC_I32 if mode == MODE_FIXED52 else ENC_I16,
                                         blend_count=len(self.blend_names), app=self.app,
                                         profile=self.profile, blend_names=self.blend_names)
-                        state = {"session_id": header.session_id, "schema": schema}
-                        with self._lock:
-                            # TCP has no SCHEMA_ACK; frames start immediately
-                            self._peers[conn] = {"session_id": header.session_id,
-                                                "schema": schema,
-                                                "max_udp_size": max_udp_size(udp_size),
-                                                "acknowledged": True,
-                                                "last_seen": time.time()}
+                        state = {"session_id": header.session_id, "schema": schema,
+                                 "max_udp_size": max_udp_size(udp_size),
+                                 "acknowledged": False}
+                        if not self._add_peer(conn, state):
+                            self._send(conn, ERROR, header.session_id, b"BUSY")
+                            return
                         self._send(conn, SCHEMA, state["session_id"], schema.body(),
-                                   schema_id=self.schema_id)
+                                   schema_id=self.schema_id, send_lock=state["send_lock"])
+                        state["acknowledged"] = True
                     elif header.message_type == PING:
-                        self._send(conn, PONG, state["session_id"] if state else header.session_id,
-                                   sequence=header.sequence)
+                        if state and header.session_id == state["session_id"]:
+                            state["last_seen"] = time.monotonic()
+                            self._send(conn, PONG, state["session_id"],
+                                       sequence=header.sequence, send_lock=state["send_lock"])
                     elif header.message_type == STOP:
-                        break
+                        return
+        except OSError:
+            pass
         finally:
-            conn.close()
+            self._drop_peer(conn, state)
+            try:
+                conn.close()
+            except OSError:
+                pass
 
     def start(self) -> None:
         self.running.set()
@@ -498,10 +623,12 @@ class FMV3Receiver:
     """Connect to an iFacialMocap / Facemotion3d app and decode its frames."""
 
     def __init__(self, host: str, *, port: int = IOS_UDP_PORT, pc_port: Optional[int] = None,
-                 transport: str = "udp", mode: int = MODE_FIXED52, fps: int = 60) -> None:
+                 transport: str = "udp", mode: int = MODE_FIXED52, fps: int = 60,
+                 bind_host: str = "127.0.0.1") -> None:
         self.host = host
         self.port = port
         self.pc_port = pc_port if pc_port is not None else port
+        self.bind_host = require_private_bind(bind_host)
         self.transport = transport
         self.mode = mode
         self.fps = fps
@@ -529,7 +656,7 @@ class FMV3Receiver:
 
     def _run_udp(self, on_frame, start: float, duration: Optional[float]) -> int:
         sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-        sock.bind(("", self.pc_port))
+        sock.bind((self.bind_host, self.pc_port))
         sock.settimeout(0.2)
         assembler = FragmentAssembler()
         last_ping = time.time()

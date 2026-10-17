@@ -1,7 +1,14 @@
 __pycache__/
 *.pyc
-face_landmarker.task
+/face_landmarker.task
 *.ndjson
+*.fbx
+.tmp/
+build/
+src/*.egg-info/
+tests/unity-compile/bin/
+tests/unity-compile/obj/
+addons/godot/.godot/
 recordings/
 .venv/
 venv/

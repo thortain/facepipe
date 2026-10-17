@@ -1,9 +1,7 @@
-"""Minimal OSC (Open Sound Control) packet writer - enough for the VMC protocol.
+"""OSC packet writer for VMC's blendshape and bone messages.
 
-VMC (Virtual Motion Capture Protocol) is OSC over UDP, commonly on port 39539
-(marionette) and 39540 (performer <- assistant). Facial expressions are sent as
-`/face/1/<blendshape_index>` with a single float argument in the VRM blendshape
-order.
+VMC receivers identify an expression by name, then apply a group of values
+with /VMC/Ext/Blend/Apply. FacePipe sends ARKit names for PerfectSync rigs.
 """
 from __future__ import annotations
 
@@ -13,66 +11,61 @@ from typing import Iterable, Tuple
 VMC_MARIONETTE_PORT = 39539
 VMC_PERFORMER_PORT = 39540
 
-# ARKit name -> VRM 1.0 blendshape index
-ARKIT_TO_VRM = {
-    "eyeBlinkLeft": 0, "eyeBlinkRight": 1,
-    "eyeLookUpLeft": 2, "eyeLookUpRight": 3,
-    "eyeLookDownLeft": 4, "eyeLookDownRight": 5,
-    "eyeLookInLeft": 6, "eyeLookInRight": 7,
-    "eyeLookOutLeft": 8, "eyeLookOutRight": 9,
-    "mouthSmileLeft": 10, "mouthSmileRight": 11,
-    "browOuterUpLeft": 12, "browOuterUpRight": 13,
-    "browDownLeft": 14, "browDownRight": 15,
-    "cheekSquintLeft": 16, "cheekSquintRight": 17,
-    "jawOpen": 18, "jawForward": 30, "jawLeft": 31, "jawRight": 32,
-    "mouthLeft": 19, "mouthRight": 20,
-    "mouthPucker": 21, "mouthFunnel": 22,
-    "noseSneerLeft": 23, "noseSneerRight": 24,
-    "tongueOut": 25,
-    "mouthClose": 33,
-    "mouthDimpleLeft": 34, "mouthDimpleRight": 35,
-    "mouthFrownLeft": 37, "mouthFrownRight": 38,
-    "mouthLowerDownLeft": 39, "mouthLowerDownRight": 40,
-    "mouthPressLeft": 41, "mouthPressRight": 42,
-    "mouthStretchLeft": 45, "mouthStretchRight": 46,
-    "mouthUpperUpLeft": 47, "mouthUpperUpRight": 48,
-    "mouthRollLower": 51, "mouthRollUpper": 52,
-    "mouthShrugLower": 53, "mouthShrugUpper": 55,
-}
-
-
 def _pad(data: bytes) -> bytes:
     remainder = len(data) % 4
     return data + b"\x00" * (4 - remainder) if remainder else data
 
 
+def _osc_string(value: str) -> bytes:
+    return _pad(value.encode("utf-8") + b"\x00")
+
+
 def osc_message(address: str, *args) -> bytes:
     """Build one OSC message. Supports float, int and str arguments."""
-    packet = address.encode("utf-8")
+    if not address.startswith("/"):
+        raise ValueError("OSC address must start with /")
+    packet = _osc_string(address)
     tags = ""
+    values = b""
     for arg in args:
         if isinstance(arg, float):
             tags += "f"
+            values += struct.pack(">f", arg)
         elif isinstance(arg, int):
             tags += "i"
+            values += struct.pack(">i", arg)
         elif isinstance(arg, str):
             tags += "s"
+            values += _osc_string(arg)
         else:
             raise TypeError(f"unsupported OSC argument type: {type(arg)}")
-    packet += b"," + tags.encode("utf-8")
-    for arg in args:
-        if isinstance(arg, float):
-            packet += struct.pack(">f", arg)
-        elif isinstance(arg, int):
-            packet += struct.pack(">i", arg)
-        else:
-            packet += arg.encode("utf-8") + b"\x00"
-    return _pad(packet)
+    return packet + _osc_string("," + tags) + values
 
 
 def bundle(messages: Iterable[Tuple[str, tuple]]) -> bytes:
-    """Build an OSC bundle from (address, args) pairs - VMC allows bundled packets."""
-    contents = b""
+    """Build a spec-compliant OSC bundle with an immediate timetag."""
+    contents = b"#bundle\x00" + struct.pack(">Q", 1)
     for address, args in messages:
-        contents += osc_message(address, *args)
-    return _pad(b"#bundle\x00" + contents)
+        message = osc_message(address, *args)
+        contents += struct.pack(">I", len(message)) + message
+    return contents
+
+
+def bundle_packets(messages: Iterable[Tuple[str, tuple]], max_size: int = 1400):
+    """Split OSC messages into UDP-sized bundles while preserving order."""
+    if max_size < 64:
+        raise ValueError("OSC packet limit is too small")
+    group = []
+    size = 16  # bundle header and timetag
+    for address, args in messages:
+        encoded_size = 4 + len(osc_message(address, *args))
+        if 16 + encoded_size > max_size:
+            raise ValueError("one OSC message exceeds the packet limit")
+        if group and size + encoded_size > max_size:
+            yield bundle(group)
+            group = []
+            size = 16
+        group.append((address, args))
+        size += encoded_size
+    if group:
+        yield bundle(group)

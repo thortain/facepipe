@@ -7,7 +7,7 @@ from .frame import Frame
 from .fmv3 import FMV3Receiver, FMV3Sender
 from .text_protocol import decode, encode
 
-__version__ = "0.1.0"
+__version__ = "0.2.0"
 
 __all__ = [
     "Frame", "ARKIT_52", "IDENTIFIERS", "RAW_VALUES", "normalize_name",

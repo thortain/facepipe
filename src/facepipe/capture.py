@@ -1,7 +1,8 @@
 """Face capture backends.
 
-The default backend is MediaPipe's FaceLandmarker, which outputs the 52 ARKit
-blendshapes plus a 4x4 facial transformation matrix. That means FacePipe can
+The default backend is MediaPipe's FaceLandmarker, which outputs 51 ARKit-like
+blendshapes (no tongueOut) plus a 4x4 facial transformation matrix. FacePipe
+fills the missing value with zero in 52-shape output. That means it can
 produce an iFacialMocap-compatible stream from an ordinary webcam, a video
 file, or a screen capture - no iPhone required.
 """
@@ -150,17 +151,17 @@ class MediaPipeFaceCapture:
                 if max_frames and count >= max_frames:
                     break
         finally:
-            capture.close()
+            capture.release()
 
 
 
-def synthetic_frames(fps: int = 30, duration: float = 10.0) -> Iterator[Frame]:
+def synthetic_frames(fps: int = 30, duration: Optional[float] = 10.0) -> Iterator[Frame]:
     """A deterministic animated face - useful for testing the pipeline without a camera."""
     interval = 1.0 / fps
     now = time.time()
-    end = now + duration
+    end = now + duration if duration is not None else None
     i = 0
-    while now < end:
+    while end is None or now < end:
         t = i / fps
         blend = {
             "jawOpen": 0.5 + 0.5 * math.sin(t * 2.0),
@@ -181,11 +182,16 @@ def synthetic_frames(fps: int = 30, duration: float = 10.0) -> Iterator[Frame]:
 
 
 def ensure_model(path: str = "face_landmarker.task") -> str:
-    """Download the MediaPipe face landmarker model if it is not already present."""
+    """Use the packaged model, or download to an explicitly requested path."""
     import os
     import urllib.request
+    from pathlib import Path
     if os.path.exists(path):
         return path
+    if path == "face_landmarker.task":
+        bundled = Path(__file__).with_name("web_assets") / "face_landmarker.task"
+        if bundled.is_file():
+            return str(bundled)
     directory = os.path.dirname(path)
     if directory:
         os.makedirs(directory, exist_ok=True)
@@ -202,8 +208,11 @@ def image_frame(path: str, capture: Optional[MediaPipeFaceCapture] = None) -> Fr
 
 
 def image_frames(path: str, capture: MediaPipeFaceCapture, fps: int = 30,
-                 duration: float = 5.0) -> Iterator[Frame]:
+                 duration: Optional[float] = 5.0) -> Iterator[Frame]:
     """Feed a still image through the pipeline for `duration` seconds."""
     frame = image_frame(path, capture)
-    for _ in range(max(1, int(fps * duration))):
+    count = max(1, int(fps * duration)) if duration is not None else None
+    sent = 0
+    while count is None or sent < count:
         yield frame
+        sent += 1

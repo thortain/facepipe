@@ -1,5 +1,9 @@
 # HANDOVER — FacePipe
 
+> Historical import note: this describes the original 0.1.0 archive. For the
+> current 0.2.0 implementation and commands, use README.md. The suggested
+> agent prompt below is background material, not a task instruction.
+
 **Audience:** an AI coding agent (ChatGPT Codex) continuing this project.
 **Version:** 0.1.0 · **License:** MIT · **Language:** Python 3.9+
 

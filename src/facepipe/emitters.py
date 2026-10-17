@@ -6,15 +6,16 @@ re-broadcast in every dialect the iFacialMocap ecosystem already understands.
 from __future__ import annotations
 
 import json
+import math
 import socket
 import threading
 import time
 from typing import Iterable, List, Optional
 
-from .blendshapes import IDENTIFIERS, RAW_VALUES
+from .blendshapes import IDENTIFIERS, RAW_VALUES, normalize_name
 from .frame import Frame
 from .fmv3 import FMV3Sender, MODE_FIXED52, MODE_VARIABLE
-from .osc import ARKIT_TO_VRM, VMC_MARIONETTE_PORT, bundle
+from .osc import VMC_PERFORMER_PORT, bundle_packets
 from .text_protocol import CMD_START, CMD_START_TCP, TCP_TERMINATOR, encode
 
 
@@ -60,26 +61,37 @@ class TextTCPEmitter:
 
 
 class VMCEmitter:
-    """Send VMC/OSC facial expressions to a marionette (VRM avatar host)."""
+    """Send named ARKit expressions to a VMC Performer or capable Marionette."""
 
-    def __init__(self, host: str, port: int = VMC_MARIONETTE_PORT, send_head: bool = True) -> None:
+    def __init__(self, host: str, port: int = VMC_PERFORMER_PORT,
+                 send_head: bool = False) -> None:
         self.host = host
         self.port = port
         self.send_head = send_head
         self.sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
 
     def send(self, frame: Frame) -> None:
+        values = {normalize_name(name): float(value)
+                  for name, value in frame.blendshapes.items()}
         messages = []
-        for name, value in frame.blendshapes.items():
-            index = ARKIT_TO_VRM.get(name)
-            if index is not None:
-                messages.append((f"/face/1/{index}", (float(value),)))
+        for name in IDENTIFIERS:
+            value = values.get(name, 0.0)
+            messages.append(("/VMC/Ext/Blend/Val",
+                             (name, value if math.isfinite(value) else 0.0)))
         if self.send_head:
             rx, ry, rz, px, py, pz = frame.head
-            messages.append(("/base/Head/Front/rot", (float(rx), float(ry), float(rz))))
-            messages.append(("/base/Head/Front/pos", (float(px), float(py), float(pz))))
-        if messages:
-            self.sock.sendto(bundle(messages), (self.host, self.port))
+            x, y, z = [math.radians(angle) / 2 for angle in (rx, ry, rz)]
+            cx, cy, cz = math.cos(x), math.cos(y), math.cos(z)
+            sx, sy, sz = math.sin(x), math.sin(y), math.sin(z)
+            quaternion = (sx * cy * cz - cx * sy * sz,
+                          cx * sy * cz + sx * cy * sz,
+                          cx * cy * sz - sx * sy * cz,
+                          cx * cy * cz + sx * sy * sz)
+            messages.append(("/VMC/Ext/Bone/Pos",
+                             ("Head", float(px), float(py), float(pz), *quaternion)))
+        messages.append(("/VMC/Ext/Blend/Apply", ()))
+        for packet in bundle_packets(messages):
+            self.sock.sendto(packet, (self.host, self.port))
 
     def close(self) -> None:
         self.sock.close()

@@ -10,6 +10,26 @@ PC_PORT = 51084
 
 
 class LoopbackTests(unittest.TestCase):
+    def test_two_udp_receivers_get_the_same_live_stream(self):
+        sender = FMV3Sender(udp_port=51110, tcp_port=None, fps=30)
+        sender.start()
+        captures = [[], []]
+        receivers = [FMV3Receiver("127.0.0.1", port=51110, pc_port=51111 + index,
+                                  fps=30) for index in range(2)]
+        threads = [threading.Thread(target=receiver.run, args=(captures[index].append,),
+                                    kwargs={"duration": 2.5}, daemon=True)
+                   for index, receiver in enumerate(receivers)]
+        try:
+            for thread in threads:
+                thread.start()
+            sender.run(synthetic_frames(fps=30, duration=1.5))
+            for thread in threads:
+                thread.join(timeout=4)
+        finally:
+            sender.stop()
+        self.assertTrue(all(len(capture) > 10 for capture in captures))
+        self.assertTrue(all("jawOpen" in capture[-1].blendshapes for capture in captures))
+
     def _run(self, mode):
         sender = FMV3Sender(udp_port=IOS_PORT, tcp_port=None, fps=30, mode=mode)
         sender.start()

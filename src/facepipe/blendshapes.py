@@ -78,7 +78,8 @@ IDENTIFIER_INDEX: Dict[str, int] = {name: i for i, name in enumerate(IDENTIFIERS
 RAW_INDEX: Dict[str, int] = {raw: i for i, raw in enumerate(RAW_VALUES)}
 _LOWER_INDEX: Dict[str, str] = {name.lower(): name for name in IDENTIFIERS}
 
-# MediaPipe FaceLandmarker emits 53 entries: `_neutral` plus the 52 ARKit identifiers.
+# The bundled FaceLandmarker model emits `_neutral` plus 51 ARKit identifiers;
+# `tongueOut` is absent and is sent as zero by the wire/FBX encoders.
 MEDIAPIPE_SKIP = {"_neutral"}
 
 

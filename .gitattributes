@@ -1,0 +1,2 @@
+src/facepipe/web_assets/vendor/** -text whitespace=-trailing-space
+src/facepipe/web_assets/face_landmarker.task -text

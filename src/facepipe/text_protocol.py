@@ -19,7 +19,7 @@ from __future__ import annotations
 import re
 from typing import Iterable, List, Optional, Tuple
 
-from .blendshapes import RAW_VALUES
+from .blendshapes import RAW_TO_IDENTIFIER, RAW_VALUES, normalize_name
 from .frame import Frame
 
 # --- handshake commands the iOS app understands -----------------------------
@@ -50,7 +50,9 @@ def encode(frame: Frame, version: int = 1, names: Optional[Iterable[str]] = None
     sep = "&" if version == 2 else "-"
     parts: List[str] = []
     for name in order:
-        parts.append(f"{name}{sep}{_percent(frame.blendshapes.get(name, 0.0))}")
+        identifier = RAW_TO_IDENTIFIER.get(name, name)
+        value = frame.blendshapes.get(name, frame.blendshapes.get(identifier, 0.0))
+        parts.append(f"{name}{sep}{_percent(value)}")
     parts.append("head#" + ",".join(f"{v:.6f}" for v in frame.head))
     parts.append("rightEye#" + ",".join(f"{v:.6f}" for v in frame.right_eye))
     parts.append("leftEye#" + ",".join(f"{v:.6f}" for v in frame.left_eye))
@@ -87,7 +89,7 @@ def decode(text: str) -> Optional[Frame]:
         if not match:
             continue
         try:
-            frame.blendshapes[match.group(1)] = float(match.group(3)) / 100.0
+            frame.blendshapes[normalize_name(match.group(1))] = float(match.group(3)) / 100.0
         except ValueError:
             continue
         found = True
