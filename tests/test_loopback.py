@@ -1,4 +1,5 @@
 import threading
+import time
 import unittest
 
 from facepipe.blendshapes import IDENTIFIERS
@@ -10,6 +11,31 @@ PC_PORT = 51084
 
 
 class LoopbackTests(unittest.TestCase):
+    def test_udp_receiver_survives_source_startup_delay(self):
+        received = []
+        errors = []
+        receiver = FMV3Receiver("127.0.0.1", port=51230, pc_port=51231, fps=30)
+
+        def receive():
+            try:
+                receiver.run(received.append, duration=3.0)
+            except Exception as error:
+                errors.append(error)
+
+        thread = threading.Thread(target=receive, daemon=True)
+        thread.start()
+        time.sleep(0.6)  # First HELLO reaches an unopened UDP port.
+        sender = FMV3Sender(udp_port=51230, tcp_port=None, fps=30)
+        try:
+            sender.start()
+            sender.run(synthetic_frames(fps=30, duration=1.2))
+            thread.join(timeout=4)
+        finally:
+            receiver.stop()
+            sender.stop()
+        self.assertFalse(errors)
+        self.assertGreater(len(received), 10)
+
     def test_two_udp_receivers_get_the_same_live_stream(self):
         sender = FMV3Sender(udp_port=51110, tcp_port=None, fps=30)
         sender.start()

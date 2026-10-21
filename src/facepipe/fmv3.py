@@ -674,6 +674,13 @@ class FMV3Receiver:
                     data, peer = sock.recvfrom(2048)
                 except socket.timeout:
                     pass
+                except ConnectionResetError:
+                    # Windows surfaces an ICMP Port Unreachable when HELLO was
+                    # sent before the source bound its UDP port. Retry the
+                    # handshake so device and server startup order is harmless.
+                    hello_sent = False
+                    time.sleep(0.1)
+                    continue
                 else:
                     if len(data) >= HEADER_SIZE:
                         header = Header.unpack(data)
